@@ -1,0 +1,477 @@
+---
+title: "Rとパンデミックの数理モデル 新型コロナウィルス(COVID-19)研究を例に"
+author: "ill-identified"
+date: "`r Sys.Date()`"
+output:
+  beamer_presentation:
+    theme: metropolis
+    latex_engine: xelatex
+    citation_package: natbib
+  revealjs::revealjs_presentation:
+    slide_level: 1
+    increment: false
+    transition: none
+    reveal_option:
+      controls: false
+bibliography: pandemic.bib
+classoption: 14pt
+header-includes: 
+  - \usepackage{zxjatype}
+  - \setmainfont[Ligatures=TeX]{Palatino Linotype}
+  - \setsansfont[Ligatures=TeX]{Arial}
+  - \setmonofont{Migu 1M}
+  - \setjamainfont{Noto Serif CJK JP}
+  - \setjasansfont{IPAゴシック}
+  - \setjamonofont{Migu 1M}
+  - \usepackage {hyperref}
+  - \usepackage[numbers]{natbib}
+  - \hypersetup {colorlinks = true, linkcolor = blue, citecolor=red}
+---
+```{r, include=F}
+require(conflicted)
+require(tidyverse)
+require(ggthemes)
+require(deSolve)
+require(ggdag)
+require(patchwork)
+# require(dagitty)
+
+conflict_prefer("filter", "dplyr")
+
+knitr::opts_chunk$set(
+  include=F, echo=F,
+  message=F, warning=F,
+  out.width = "75%",
+  digits = 3,
+  cache=F,
+  fig.align = "center",
+  # ggplot2の日本語埋め込みに必要
+  dev = "cairo_pdf",
+  dev.args = list(family = "Noto Sans CJK JP", pointsize = 25) 
+  )
+
+thm <- theme_classic(base_size = 20) + theme(legend.position = "top", axis.title.y = element_text(angle = 90, vjust = .5), legend.title = element_blank())
+```
+
+# 概要
+* これまでのあらすじ:
+  + **毎回間に合わなかったり遅刻したりしたらついにイベントの方から遠ざかってった**
+* 今回やる話:
+  + 新型コロナウィルス(COVID-19) の時事ネタに乗っかって感染症の流行モデルの話.
+* 当初やる予定だった話はTokyo.Rが再開したらやる予定
+* SIR, SEIRという基本的な感染症流行モデルのシミュレーションの話
+* 上記のさらに発展的な話
+* **今回はちゃんとRの話もする**
+
+
+# イントロダクション
+
+--------
+
+# 読む前から分かっていること
+
+1. 中国の武漢中心に新型コロナウィルス(COVID-19)が流行
+2. SIR/SEIRモデルは感染症の流行モデルで最も基本的
+3. SIRモデルやSEIRモデルは計算が簡単
+4. 今回はモデルから分かることを掘り下げる
+5. 一度感染した人が再感染する場合を考慮したモデルがある
+
+
+# これを読んで分かること
+1. SIR/SEIRモデルは再感染を考慮しない. パンデミックが起こるのは1度きり
+2. 感染予防はパンデミックの規模を軽減したり発生を遅らせたり
+3. 再感染を考慮するモデルはもっと予想しづらい結果
+4. SEIRモデルを拡張してCOVID-19の流行を分析した研究がもうある
+5. 付録として具体的な数値計算の方法のヒントを書いた
+6. お前, 得したな
+
+# なぜシミュレーションか?
+[@peng2020Epidemic]
+> 統計モデルに対動学方程式の数理モデルは注目されないが, 伝染病動学のより詳しいメカニズムを得ることができる
+
+
+* 分析には必ず「ある仮定のもとで」という前置き
+* **現実では人間が対策を立てることで結果を変えられる**. 
+* 想定してない行動を取ることで結果は良い方にも悪い方にも変化 
+* 将来の予言ではなく「もしこの行動を取ったら?」の想像が重要
+
+# 教科書
+* 詳しくないので @vynnycky2010Introduction を読む.
+* 他にちょうどいい「入門」があるのかは知らない
+```{r, include=T}
+knitr::include_graphics("images.jpeg")
+```
+
+# SIRモデル
+
+* **SIRモデル**は人口全体を3つに分割
+  + **感受性人口** (感染しうる人の数, $S(t)$)
+  + **感染人口** ($I(t)$)
+  * **回復人口**( $R(t)$)
+* 一定確率で感受性, 感染, 回復へ順に遷移
+
+```{r diagram-sir, fig.cap="SIRモデルの構造", include=T}
+diag_sir <- dagify(I ~ S, R ~ I,
+                   labels = c("S" = "感受性", "I" = "感染", "R" = "回復"),
+                   coords = list(x = c(S = 0, I = .1, R = .2), y = c(S = 0, I = 0, R = 0))
+                   ) %>% tidy_dagitty() %>% mutate(label_edge = c("gamma", "beta", NA))
+diag_sir %>% ggplot(aes(x = x, y = y, xend = xend, yend = yend)) +
+  geom_dag_node(size = 30) +
+  geom_dag_edges(edge_width = 2, arrow_directed = grid::arrow(length = grid::unit(.1, "npc"), type = "closed")) +
+  geom_dag_text(aes(label = label)) +
+  geom_label(aes(x = (x + xend)/2, y = (y + yend)/2, label = label_edge), parse = T, size = 10) +
+  theme_dag_blank() + coord_fixed(ratio = .3)
+```
+
+# SIRモデルの数式
+
+*  $\beta$,  $\gamma$はパラメータ
+
+1. 一定期間ごとに未感染者から$\beta$の割合で感染者が発生
+2. 感染者は$\gamma$の割合で感染から回復
+
+$$\begin{aligned}
+\frac{dS(t)}{dt} &=	-\beta S(t)I(t),\\
+\frac{dI(t)}{dt} &=	\beta S(t)I(t)-\gamma I(t),\\
+\frac{dR(t)}{dt} &=	\gamma I(t)
+\end{aligned}$$
+
+# 計算結果のプロット
+
+```{r plot-sir, include=T}
+sir <- function(t, y, params){
+  with(
+    as.list(c(params, y)),
+    list(c(
+      S = -beta * S * I,
+      I = beta * S * I - gamma * I,
+      R = gamma * I)
+    ))
+}
+y_init <- c(S = .9999999, I = .0000001, R = 0)
+out <- ode(y = y_init, times = 1:100, func = sir, parms = c(beta = 1.0, gamma = .1))
+as_tibble(out) %>% mutate_all(as.numeric) %>% pivot_longer(cols = S:R) %>%
+  mutate(name = factor(name, levels = c("S", "R", "I"), labels = c("感受性人口", "回復人口", "感染人口"))) %>%
+  ggplot() + aes(x = time, y = value, group = name, fill = name) + geom_area() +
+  scale_fill_tableau() + thm +
+  labs(x = "経過時間", y = "人口割合", caption = "※数値は実際の感染者数を予想するものではありません") +
+  scale_y_continuous(labels = scales::percent)
+```
+
+# 感染・非感染の二分割表示
+
+```{r plot-sir2, include=T}
+as_tibble(out) %>% mutate_all(as.numeric) %>% mutate(no_I = 1 - I) %>% select(time, I, no_I) %>% pivot_longer(cols = I:no_I) %>%
+  mutate(name = factor(name, levels = c("no_I", "I"), labels = c("非感染人口", "感染人口"))) %>%
+  ggplot() + aes(x = time, y = value, group = name, fill = name) + geom_area() +
+  scale_fill_tableau() + thm +
+  labs(x = "経過時間", y = "人口割合", caption = "※数値は実際の感染者数を予想するものではありません") + 
+  scale_y_continuous(labels = scales::percent)
+```
+
+# パラメータを変えると?
+* さっきより感染力パラメータを小さくする
+* 確かに感染増加のタイミングが遅れた
+* ピーク時の感染者数が低下した
+
+```{r plot-sir-beta, include=T}
+out_low_beta <- ode(y = y_init, times = 1:100, func = sir, parms = c(beta = .5, gamma = .1))
+as_tibble(out_low_beta) %>% mutate_all(as.numeric)  %>% pivot_longer(cols = S:R) %>%
+  mutate(name = factor(name, levels = c("S", "R", "I"), labels = c("感受性人口", "回復人口", "感染人口"))) %>%
+  ggplot() + aes(x = time, y = value, group = name, fill = name) + geom_area() +
+  scale_fill_tableau() + thm +
+  labs(x = "経過時間", y = "人口割合", caption = "※数値は実際の感染者数を予想するものではありません") + 
+  scale_y_continuous(labels = scales::percent)
+```
+
+# SIRモデルの性質
+
+* あるタイミングで爆発的に感染者が増加
+* ピークに達した後は減少する
+* 感染力が低いと感染規模・感染スピード低下
+
+# パンデミックの発生条件
+
+* 感染者より回復者のほうが増えるスピードが速ければ感染者は増えないので
+* 感染初期はほとんど感染者がいない
+  + この条件をもとに微分方程式を解く[@Inaba2002].
+  
+$$
+I(t) = I(0)\exp((\beta N −\gamma)t)
+$$
+
+* 以下が増加の条件
+
+$$
+R_0 = \frac{\beta N}{\gamma} > 1
+$$
+
+* $R_0$が小さかったらパンデミックは起こらない
+
+# 現実に置き換えると
+* COVID-19は **飛沫感染と接触感染のリスクが高いとされる**(厚労省)
+* 人間同士の距離が近く, より多くの人間と接触があるほど感染力が$\beta$が増加
+* $R_0>1$は**人口密度が一定の値を超えるかどうか**を表している
+* 外出を避け繁華街を出歩かないようにすることはパンデミックの抑止に効果がある
+
+# 厚労省の図
+* 厚生労働省のサイトでも似たような図
+* ここまでのSIRモデルの話と合致する
+
+```{r mhlw, fig.cap="新型コロナウィルス対策の目的 (厚生労働省『新型コロナウイルス感染症について』より)", include=T}
+knitr::include_graphics("mhlw-chart.png")
+```
+
+# Rでのやりかた
+* グラフ図は`ggdag`パッケージで作成
+* 人口構成のグラフはもちろん`ggplot2`
+* SIRモデルのシミュレーションは常微分方程式を解く必要
+  + `deSolve::ode()`を使う
+  + 以下も参考になる
+http://statmodeling.hatenablog.com/entry/sir-model-ode-1
+* 今回紹介したものは基本的に全部これで解ける
+
+# `deSolve::ode()`
+* 引数: 初期値, 区間, 方程式を表す関数, パラメータ
+  + 関数はパラメータと$t$に対する$dS(t)/dt, dI(t)/dt, dR(t)/dt$を**リストで**返す必要
+  + `with()` を使うと見やすい
+
+```{r, eval=F, include=T, echo=T}
+sir <- function(t, y, params){
+  with(
+    as.list(c(params, y)),
+    list(c(
+      S = -beta * S * I,
+      I = beta * S * I - gamma * I,
+      R = gamma * I)
+    ))
+}
+```
+
+# より現実を反映したモデル
+* SIRモデルでは**回復した人間は二度と感染しない**
+* + 新規感染者数は感受性人口と感染人口と感染力$\beta$の積で決定
+  + 回復人口が増えると新規感染者数が減る
+* SIRモデルの**ピークが一度きり**の理由
+* 当てはまりやすい例: はしか
+* 全ての伝染病に当てはまるわけではない
+
+# 再感染の可能性を考える
+
+* 回復した人が再感染する場合を考える
+* 免疫を失う人の割合を$\rho$として, SIRモデルを改造
+
+```{r diagram-sirs, fig.cap="SIRSモデルの構造", include=T}
+diag_sirs <- dagify(I ~ S, R ~ I, S ~ R, 
+                   labels = c("S" = "感受性", "I" = "感染", "R" = "回復")
+                   ) %>% tidy_dagitty() %>% mutate(label_edge = c("gamma", "rho", "beta"))
+diag_sirs %>% ggplot(aes(x = x, y = y, xend = xend, yend = yend)) +
+  geom_dag_node(size = 30) +
+  geom_dag_edges(edge_width = 2, arrow_directed = grid::arrow(length = grid::unit(.1, "npc"), type = "closed")) +
+  geom_dag_text(aes(label = label)) +
+  geom_label(aes(x = (x + xend)/2, y = (y + yend)/2, label = label_edge), parse = T, size = 10) +
+  theme_dag_blank()
+```
+
+# 再感染のシミュレーション例
+* 1%の確率で免疫を失う場合
+
+```{r plot-sirs, include=T}
+sirs <- function(t, y, params){
+  with(
+    as.list(c(params, y)),
+    list(c(
+      S = -beta * S * I + rho * R,
+      I = beta * S * I - gamma * I,
+      R = gamma * I - rho * R)
+    ))
+}
+out_sirs <- ode(y = y_init, times = 1:100, func = sirs, parms = c(rho = .01, beta = 1.0, gamma = .1))
+as_tibble(out_sirs) %>% mutate_all(as.numeric) %>%
+  pivot_longer(cols = S:R) %>%
+  mutate(name = factor(name, levels = c("S", "R", "I"), labels = c("感受性人口", "回復人口", "感染人口"))) %>%
+  ggplot() + aes(x = time, y = value, group = name, fill = name) + geom_area() +
+  scale_fill_tableau() + thm +
+  labs(x = "経過時間", y = "人口割合", caption = "※数値は実際の感染者数を予想するものではありません") +
+  scale_y_continuous(labels = scales::percent)
+```
+
+
+# SEIRモデル
+* SとIの間にEを追加
+* Eは潜伏期間
+  + 感染したが発症も他人に伝染してもいない
+* 正確なパラメータがないとSIRと大差ない
+  
+```{r diagram-seir, include=T}
+diag_seir <- dagify(R ~ I, I ~ E, E ~ S,
+                   labels = c("S" = "感受性", "E" = "潜伏", "I" = "感染", "R" = "回復"),
+                   coords = list(x = c(S = 0, E =.1,  I = .2, R = .3), y = c(S = 0, E = 0, I = 0, R = 0))
+                   ) %>% tidy_dagitty() %>% mutate(label_edge = c("beta", "gamma", "lambda", NA))
+diag_seir %>% ggplot(aes(x = x, y = y, xend = xend, yend = yend)) +
+  geom_dag_node(size = 30) +
+  geom_dag_edges(edge_width = 2, arrow_directed = grid::arrow(length = grid::unit(.1, "npc"), type = "closed")) +
+  geom_dag_text(aes(label = label)) +
+  geom_label(aes(x = (x + xend)/2, y = (y + yend)/2, label = label_edge), parse = T, size = 10) +
+  theme_dag_blank()
+```
+
+
+# COVID-19のシミュレーション
+* 早くも2つの研究が arXivに投稿されている
+  + @zhou2020Outbreak(YJ-SEIR), @peng2020Epidemic(一般化SEIR)
+* 中国国内のCOVID-19流行をシミュレーション
+* いずれも隔離政策の影響を考慮した修正版SIERモデル
+
+# YJ-SEIRモデル
+* 「隔離政策以降, 新規患者数増加がが鈍化している」
+* 現在わかっていること:
+
+  1. 武漢市では交通を遮断, 住民の外出も制限
+  2. 臨時の救急医療体制を構築し, 効果が出ている
+  3. 交通を遮断する以前には多くの人間の流入出があった
+  4. COVID-19は間接接触でも感染する可能性
+
+* 隔離を行った後でも(3), (4)で感染拡大の可能性
+* 「**これまでの感染数推移はSEIRモデルの結果と異なる**」
+
+# YJ-SEIRモデルの構造
+* 2つのグループを追加
+  + 感染が確認されていないため未隔離の人間
+  + 間接接触で感染した人間
+* 残存したCOVID-19による汚染の影響を考慮
+
+```{r diagram-yjseir, include=T, fig.heigh="40%"}
+diag_yjseir <- dagify(
+  Y ~ E,
+  J ~ E,
+  S ~ Y,
+  E ~ S,
+  I ~ E + Y,
+  R ~ J + I,
+  labels = c("Y" = "Suspected", "J" = "間接接触", "S" = "感受性", "E" = "潜伏", "I" = "感染", "R" = "回復"),
+  coords = list(x = c(Y = 1.5, J = 2, S = 0, E = 1, I = 2, R =3),
+                y = c(Y = .5, J = -.5, S = 0, E = 0, I = 0, R = 0)
+                )
+  ) %>% tidy_dagitty() %>% mutate(label_edge = c("beta", NA, NA, "gamma", NA, "lambda",  NA, NA, NA))
+diag_yjseir %>% ggplot(aes(x = x, y = y, xend = xend, yend = yend)) +
+  geom_dag_node(size = 30) +
+  geom_dag_edges(edge_width = 2, arrow_directed = grid::arrow(length = grid::unit(.1, "npc"), type = "closed")) +
+  geom_dag_text(aes(label = label)) +
+  geom_label(aes(x = (x + xend)/2, y = (y + yend)/2, label = label_edge), parse = T, size = 10) +
+  theme_dag_blank() + coord_fixed(ratio = 1)
+```
+
+# 一般化SEIRモデル
+
+* YJ-SEIRよりもシンプル
+* 以下のグループを追加
+  + 感染の恐れのなくなった非感受状態 $P$
+  + 感染がわかると隔離状態$Q$に移行
+  * 死亡状態$D$を明示的に回復人口から分離
+
+```{r diagram-gSEIR, include=T}
+diag_g_seir <- dagify(
+  P ~ S,
+  E ~ S,
+  I ~ E,
+  Q ~ I,
+  R ~ Q,
+  D ~ Q,
+  labels = c("Q" = "隔離", "P" = "非感受性", "D" = "死亡",
+             "S" = "感受性", "E" = "潜伏", "I" = "感染", "R" = "回復"),
+  coords = list(x = c(S = 0, P = 1, E = 1, I = 2, Q = 3, R = 4, D = 4),
+                y = c(S = 1, P = .7, E = 1, I = 1, Q = 1, R = 1, D = .7)
+                )
+  ) %>% tidy_dagitty() %>% mutate(label_edge = c("beta", "delta", "mu", "gamma", "lambda", "alpha", NA, NA, NA))
+diag_g_seir %>% ggplot(aes(x = x, y = y, xend = xend, yend = yend)) +
+  geom_dag_node(size = 30) +
+  geom_dag_edges(edge_width = 2, arrow_directed = grid::arrow(length = grid::unit(.1, "npc"), type = "closed")) +
+  geom_dag_text(aes(label = label)) +
+  geom_label(aes(x = (x + xend)/2, y = (y + yend)/2, label = label_edge), parse = T, size = 10) +
+  theme_dag_blank() + labs(caption="注: パラメータ名は元論文から変更している") +
+  coord_cartesian(xlim = c(0, 4), ylim = c(.6, 1.1))
+```
+
+
+# G-SEIRモデルの再現
+*  著者らの主目的は
+  + COVID-19が発生した時期
+  + アウトブレイク終息時期の推定
+* まずモデルのパラメータを正確に推定する必要
+  + 具体的な数値が掲載されていたので真似してみる
+  + 湖北省(除外武漢市)の推定結果を使う
+  
+# G-SEIRモデルの結果
+* だいたい50日くらいで終息するという結果に
+```{r gSEIR, include=T}
+gseir <- function(t, y, params){
+  with(
+    as.list(c(params, y)),
+    list(c(
+      S = -lambda * S * I - alpha * S,
+      P = alpha * S,
+      E = lambda * S * I - beta * E,
+      I = beta * E - delta * I,
+      Q = delta * I - (gamma + mu) * Q,
+      R = gamma * Q,
+      D = mu * Q,
+      gamma = dlogis(t, 60, 10),
+      mu = -0.9 * mu
+      )))
+}
+# Hubei(without Wuhan)
+span <- 60
+E0 <- 592/45e6
+I0 <- 515/45e6
+out_gseir <- ode(
+  y = c(S = 1 - E0 - I0, P = 0, E = E0, I = I0, Q = 0, R = 0, D = 0, gamma = plogis(1, 60, 10), mu = exp(-.9 * (1 + 3)) + .001),
+  times = 1:span, func =  gseir, parms = c(alpha = .133, lambda = 1.0, beta = 2^-1, delta = 7.2^-1))
+df_gseir <-  as_tibble(out_gseir) %>% mutate_all(as.numeric) %>%
+  mutate(date = seq(as.Date("2020/1/20"), as.Date("2020/1/20") + span - 1, by = "1 day")) %>%
+  pivot_longer(cols = S:D) %>%
+  mutate(name = factor(name, levels = c("S", "P", "E", "I", "Q", "R", "D"),
+                       labels = c("感受性", "非感受性", "潜伏期間", "感染", "隔離", "回復", "死亡")))
+df_gseir %>% filter(name %in% c("潜伏期間", "感染", "隔離", "回復", "死亡")) %>%
+  mutate(value = if_else(value < 0, 0, value),
+         category = if_else(name %in% c("潜伏期間", "感染"), "未隔離", "隔離")
+         ) %>%
+  ggplot() + aes(x = date, y = value, group = name, fill = name) + geom_area() +
+  scale_fill_tableau() + thm + theme(axis.title.x = element_blank(), axis.text.x = element_text(angle = -45)) +
+  facet_wrap(~category, scales = "free_y", ncol = 1, strip.position = "left") +
+  labs(y = "人口割合", caption = "※数値は実際の感染者数を予想するものではありません") +
+  scale_x_date(date_breaks = "2 weeks") + scale_y_continuous(labels = scales::percent)
+```
+
+# 補足1
+* 回復率・死亡率パラメータは時間によって変化
+  + 徐々に治療体制が確立されているため
+  + 回復率は増加, 死亡率は低下
+* プログラムではパラメータも変数として計算する
+* 具体的な数値はなかったので適当に設定
+
+$$\begin{aligned}
+\mu(t) &= \exp(-0.9(t+3))+0.001,\\
+\gamma(t) &= \mathit{logistic}((t-60)/10)
+\end{aligned}$$
+
+# 補足2
+
+* **このシミュレーションは日本にも適用できるか?**
+* 適切にパラメータを推定すればできる
+* 感染力パラメータの意味
+  1. ウィルスの特性
+  2. 自然環境の特性
+  3. 社会環境の特性
+  + (2), (3) は日中でかなり違う
+  + 数字をそのまま持ってきても**無意味**
+* **専門的な話はWHOとかNIIDとか厚労省とかの発表を待て**
+* マルチエージェントシミュレーションの話もやりたかったけど時間が足りなかった
+
+# わかったことのまとめ
+* SIRモデルでは感染>回復でパンデミックが始まる.
+  + 感染増加を抑えるとパンデミックの開始を遅らせたり, ピーク時の感染者数を軽減できる.
+* 感染力変化モデル, 再感染モデル, マルチエージェントシミュレーションなどがある
+* 今回のCOVID-19の隔離措置を考慮したシミュレーションした研究がある
+* 実際に感染がどれだけ広がるのか, それはまだ混沌の中…
+* **それが……, パンデミック…!**
